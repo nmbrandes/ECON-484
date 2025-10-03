@@ -1,0 +1,783 @@
+---
+title: "484 Take Home Exam"
+author: "Noah Brandes"
+date: "2025-06-06"
+output: html_document
+---
+
+```{r packages, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(randomForest)
+library(BART)
+library(gbm)
+library(glmnet)
+library(data.table)
+library(class)
+library(MASS)
+library(nnet)
+library(caret)
+library(e1071)
+library(tree)
+```
+
+```{r reading data in}
+setwd("C:/Users/School/OneDrive/Desktop/ECON 484/Take Home Final")
+
+acc <- fread("accepted_2007_to_2018q4.csv/accepted_2007_to_2018Q4.csv")
+rej <- fread("rejected_2007_to_2018q4.csv/rejected_2007_to_2018Q4.csv")
+```
+
+```{r cleaning functions}
+months_since <- function(x) {
+  month <- substr(x, 1, 3)
+  month <- recode(month,
+    Jan = 1,
+    Feb = 2,
+    Mar = 3,
+    Apr = 4,
+    May = 5,
+    Jun = 6,
+    Jul = 7,
+    Aug = 8,
+    Sep = 9,
+    Oct = 10,
+    Nov = 11,
+    Dec = 12
+  )
+  year <- as.numeric(substr(x, 5, 8))
+  months_ad <- 12*year+month
+  v <- 2019*12 + 4 - months_ad
+  
+  v <- ifelse(is.na(v), mean(na.omit(v)), v)
+  return(v)
+}
+
+remove_outliers <- function(x, na.rm = TRUE, ...) {
+  qnt <- quantile(x, probs=c(.25, .75), na.rm = na.rm, ...)
+  H <- 2.5 * IQR(x, na.rm = na.rm)
+  y <- x
+  y[x < (qnt[1] - H)] <- NA
+  y[x > (qnt[2] + H)] <- NA
+  y
+}
+```
+
+Want to predict Z|X assuming Z|X distributed identically in rej vs acc
+-i.e. we assume we have access to all information that the loan decision
+      was based off of, which is probably true
+
+
+```{r rejected dataframe construction}
+# Constructs clean rejected dataframe
+dti <- as.numeric(gsub("%","", rej$`Debt-To-Income Ratio`))
+rej_c <- data.frame(dti)
+```
+
+rej\$Amount.Requested ~ acc\$loan_amnt
+rej\$Risk_Score ~ (acc\$last_fico_range_low + acc\$last_fico_range_high)/2) 
+rej\$Application.Date can be dropped (no analogue in acc)
+rej\$Loan.Title ~ acc\$title # Drop since not used for pred
+rej_c\$dti.ratio ~ acc\$dti # Perf match, but cleaned
+rej\$Zip.Code ~ acc\$zip_code # dropped
+rej\$State ~ acc\$addr_state # Perf match
+rej\$Employment.Length ~ acc\$emp_length
+rej\$Policy.Code ~ acc\$policy_code
+
+```{r rejected dataframe cleaning}
+# Removes % signs from rej$dti. Note acc$dti, rej$dti scaled by 100
+rej_c$dti <- dti
+
+
+# Credit Score, amount
+rej_c$loan_amnt <- rej$`Amount Requested`
+rej_c$risk <- rej$Risk_Score
+
+
+# Factorizes employment. 
+# Unfortunately I have to drop state because it has 50 levels of varying
+# proportions that cause issues with uniqueness and omission at many points.
+rej_c$emp_len <- as.factor(rej$`Employment Length`)
+
+
+# Work with a manageable size.
+# If more compute was available, higher sample size would improve results.
+set.seed(903)
+ind <- sample(nrow(rej_c), 10000, replace = FALSE)
+rej_c <- rej_c[ind,]
+```
+
+This function is mostly for use later but I also apply it to simulate risk,
+so I include it here.
+
+```{r numerical simulation function}
+# z is the target vector, x is the feature matrix, and k is the number of folds
+# new_x is the data to simulate z_hat for. Returns z_hat
+num_sim_cv <- function(z, x, k, new_x) { 
+  n <- nrow(x)
+  folds <- sample(rep(1:k, length.out = n))
+  err <- matrix(nrow = k, ncol = 3)
+  
+  # Optimize for tuning parameters
+  df_tune <- data.frame(z = z, x)
+  test.mse <- vector(length = 8)
+  
+  lambda <- 0.0005 * (2)^(1:8)
+  
+  tt_ind <- sample(nrow(df_tune), floor(nrow(df_tune) / 4), replace = FALSE)
+  df_tune_test <- df_tune[tt_ind, ]
+  df_tune_train <- df_tune[-tt_ind, ]
+  z_tune_test <- z[tt_ind]
+  
+  for (i in 1:8) {
+    boost_tune <- gbm(z ~ ., data = df_tune_train,
+                      n.trees = 300, distribution = "gaussian",
+                      interaction.depth = 4, shrinkage = lambda[i])
+    test.mse[i] <- mean((predict(boost_tune, newdata = df_tune_test, n.trees = 300) - z_tune_test)^2)
+  }
+  best_lambda <- lambda[which.min(test.mse)]
+    
+  # Cross-validation loop
+  for (i in 1:k) {
+    test_idx <- which(folds == i)
+    train_idx <- setdiff(1:n, test_idx)
+    
+    x_train <- x[train_idx, , drop = FALSE]
+    x_test  <- x[test_idx, , drop = FALSE]
+    z_train <- z[train_idx]
+    z_test  <- z[test_idx]
+    
+    df_train <- data.frame(z = z_train, x_train)
+    df_test  <- data.frame(x_test)
+    
+    # Random Forest
+    rf_fit <- tryCatch({
+      randomForest(z ~ ., data = df_train, ntree = 200)
+    }, error = function(e) NULL)
+    
+    err[i, 1] <- if (!is.null(rf_fit)) {
+      mean((predict(rf_fit, newdata = df_test) - z_test)^2)
+    } else NA
+
+    # Boosted Model
+    boost_fit <- tryCatch({
+      gbm(z ~ ., data = df_train, n.trees = 300, 
+          distribution = "gaussian", interaction.depth = 4, 
+          shrinkage = best_lambda)
+    }, error = function(e) NULL)
+    
+    err[i, 2] <- if (!is.null(boost_fit)) {
+      mean((predict(boost_fit, newdata = df_test, n.trees = 300) - z_test)^2)
+    } else NA
+
+    # OLS
+    ols_fit <- tryCatch({
+      lm(z ~ ., data = df_train)
+    }, error = function(e) NULL)
+    
+    err[i, 3] <- if (!is.null(ols_fit)) {
+      mean((predict(ols_fit, newdata = df_test) - z_test)^2)
+    } else NA
+  }
+  
+  # Choose best model
+  cv_err <- colMeans(err, na.rm = TRUE)
+  print(err)
+  best_model <- which.min(cv_err)
+  print(paste("best model is", best_model))
+  
+  df_full <- data.frame(z = z, x)
+  new_df <- data.frame(new_x)
+  
+  # Fit best model on full data
+  if (best_model == 1) {
+    best_fit <- randomForest(z ~ ., data = df_full, ntree = 200)
+    best_preds <- predict(best_fit, newdata = new_df)
+  } else if (best_model == 2) {
+    best_fit <- gbm(z ~ ., data = df_full, n.trees = 300, 
+                    distribution = "gaussian", interaction.depth = 4, 
+                    shrinkage = best_lambda)
+    best_preds <- predict(best_fit, newdata = new_df, n.trees = 300)
+  } else {
+    best_fit <- lm(z ~ ., data = df_full)
+    best_preds <- predict(best_fit, newdata = new_df)
+  }
+  
+  # Simulate z based on predicted means
+  z_sim <- rnorm(length(best_preds), mean = best_preds, 
+                 sd = sqrt(cv_err[best_model]))
+  return(z_sim)
+}
+```
+
+```{r rejected set risk score simulation}
+# We don't have all the data for rej_c$risk, and that is the only missing data
+sum(is.na(rej_c))
+sum(is.na(rej_c$risk))
+
+# Model risk scores
+x_train <- na.omit(rej_c)
+z_train <- x_train$risk
+x_train <- dplyr::select(x_train, -"risk")
+x_new <- subset(rej_c, !is.na(rej_c$risk))
+
+risk_sim <- num_sim_cv(z_train, x_train, 5, x_new)
+
+# Examine simulated data
+hist(risk_sim, breaks = 30, main = "Simulated Risk")
+hist(rej_c$risk, breaks = 30, main = "Actual Risk")
+
+# Update full rejected set with simulated risk scores
+rej_c$risk[is.na(rej_c$risk)] <- risk_sim
+sum(is.na(rej_c$risk))
+
+# Examine Simulated data
+mean(rej_c$risk)
+var(rej_c$risk) 
+mean(na.omit(rej$Risk_Score))
+var(na.omit(rej$Risk_Score)) 
+
+# Variance differs but by very little. Means indistinguishable.
+```
+
+```{r accepted dataframe cleaning}
+# Deal with NAs by defining two new variables: one describes if an NA is 
+# present, and one describes the value if an NA is not present. The latter
+# variable fills all NAs with 0.
+vars_w_na <- c()
+set.seed(904)
+ind <- sample(nrow(acc), 100000, replace = FALSE)
+acc_c <- acc[ind,]
+
+for (i in 1:ncol(acc_c)) {
+  v <- acc_c[[i]]
+  vname <- names(acc_c)[i]
+  num_na <- sum(is.na(v))
+  
+  if (num_na > 0) {
+    acc_c[[paste0(vname, "_NA")]] <- as.factor(ifelse(is.na(v), 1, 0))
+    
+    if (is.numeric(v)) {
+      acc_c[[paste0(vname, "")]] <- ifelse(is.na(v), median(na.omit(v)), v)
+    } else {
+      acc_c[[paste0(vname, "")]] <- ifelse(is.na(v), "", v)
+    }
+  }
+}
+
+acc_c <- dplyr::select(acc_c, -any_of(vars_w_na))
+
+
+# Clean acc data
+to_drop <- c()
+for (i in 1:ncol(acc_c)) {
+  v <- acc_c[[i]]
+  vname <- names(acc_c)[i]
+  t <- typeof(v)
+
+  # Drop constant numeric cols
+  if (is.numeric(v) && length(unique(na.omit(v))) <= 1) {
+    to_drop <- c(to_drop, vname)
+
+  # Handle character columns
+  } else if (t == "character") {
+    # If it looks like a date in format "Mon-yyyy"
+    if (sum(substr(v, 4 ,4) == "-") == nrow(acc_c) - sum(v == "") &
+        sum(substr(v, 4 ,4) == "-") > 100) {
+      acc_c[[paste0("mths_since_", vname)]] <- months_since(v)
+      print(vname)
+    # If it's a factor-like character (few unique values), factorize
+    } else if (length(unique(na.omit(v))) < 100) {
+      factorized_v <- as.factor(v)
+      if (length(levels(factorized_v)) >= 2) {
+        acc_c[[paste0(vname, "_f")]] <- factorized_v
+      }
+    } 
+    to_drop <- c(to_drop, vname)
+  } else if (t == "integer" && length(unique(na.omit(v))) < 2) {
+    to_drop <- c(to_drop, vname)
+  }
+}
+
+acc_c <- dplyr::select(acc_c, -any_of(to_drop))
+```
+
+```{r default simulation}
+default_sim <- function(inc, dti, amnt, fico_low, fico_high) {
+  # Manually tinkered with values until about 1% default
+  b0 <- -8
+  b1 <- -4
+  b2 <- 0.5
+  b3 <- 2
+  b4 <- -3
+  
+  # Underlying data model for whether an individual defaults
+  probs <- 1 / (1 + exp(-(b0 + b1 * scale(inc) +
+                               b2 * scale(dti) +
+                               b3 * scale(amnt) +
+                               b4 * scale(((fico_low + 
+                                            fico_high) / 2)))))
+  
+  def <- rbinom(n=nrow(probs), size = 1, prob = probs)
+  return(def)
+}
+
+# Simulate defaulting with these probabilities
+acc_c$defaults <- default_sim(acc_c$annual_inc, acc_c$dti, acc_c$loan_amnt,
+                              acc_c$fico_range_low, acc_c$fico_range_high)
+
+# Ensure default rate is acceptable
+mean(acc_c$defaults)
+```
+
+
+I now use LASSO with the binomial family to evaluate variable importance and
+select which variables to use for the rest of the project.
+
+```{r lasso for variable selection}
+# Target var names may vary a bit randomly (if an NA was in the subsample), 
+# hence the appearance of repeats
+
+targets <- c("annual_inc", "annual_inc_NA", "annual_inc",
+             "dti", "dti_NA", "dti", "loan_amnt",
+             "loan_amnt_NA", "loan_amnt", "fico_range_low",
+             "fico_range_low_NA", "fico_range_low", "fico_range_high",
+             "fico_range_high_NA", "fico_range_high")
+
+# Formula for the variable selection lasso
+formula <- as.formula(
+  paste("defaults ~", 
+        paste(setdiff(names(acc_c), c(targets, "defaults")), 
+              collapse = " + "))
+)
+
+# I choose here to over-sample defaulting observations. It costs too much 
+# computing power to be feasible if n >> 2500, and if I simply set n=2500
+# then the default rate is too small for meaningful results. After a careful
+# examination of lasso assumptions I am confident that this does not 
+# invalidate the variable selection procedure.
+x_def <- acc_c[which(acc_c$defaults == 1),]
+x_nodef <- acc_c[which(acc_c$defaults == 0),]
+set.seed(956)
+ind <- sample.int(nrow(x_nodef), nrow(x_def), replace = FALSE)
+x_nodef_train <- acc_c[ind,]
+x_train <- union(x_def, x_nodef_train)
+
+x <- model.matrix(defaults ~ ., data = x_train)
+
+# I use the binomial family since $defaults is binary.
+cv_fit <- cv.glmnet(x, x_train$defaults, family = "binomial")
+
+# Extract optimal lambda and the corresponding coefficients
+best_lambda <- cv_fit$lambda.min
+beta <- coef(cv_fit, s = best_lambda)
+
+# Find all nonzero betas
+nz <- rownames(beta)[beta[, 1] != 0][-1]
+
+# I collapse factor variables
+base_vars <- gsub("_f.*", "_f", nz)
+important_vars <- unique(base_vars)
+length(important_vars)
+
+# I define a new accepted set to work with from here forward 
+# These are the clean and important accepted observation
+acc_ci <- dplyr::select(acc_c, any_of(union(important_vars, nz)))
+acc_ci$defaults <- as.factor(acc_c$defaults)
+
+acc_ci$dti <- remove_outliers(acc_ci$dti)
+acc_ci$loan_amnt <- remove_outliers(acc_ci$loan_amnt)
+acc_ci <- na.omit(acc_ci)
+```
+
+Lasso has selected 40 variables that are important to determine if a person
+will default or not. This is an improvement over the ~150 provided, and 
+is a substantial improvement over the ~250 that existed once NAs were expanded
+into two variables for use in regression. It seems noteworthy that that there 
+are \$xi_na and \$xi pairs for which only one was selected, but I don't
+believe this necessarily invalidates the process, and I will proceed with 
+simulation nonetheless.
+
+```{r categorical simulation function}
+# z is the target vector, x is the feature matrix, and k is the number of folds
+# new_x is the data to simulate z_hat for. Returns z_hat
+class_sim_cv <- function(z, x, k, new_x) { 
+  n <- nrow(x)
+  folds <- sample(rep(1:k, length.out = n))
+  err <- matrix(nrow = k, ncol = 3)
+  
+  for (i in 1:k) {
+    test_idx <- which(folds == i)
+    train_idx <- setdiff(1:n, test_idx)
+    
+    x_train <- x[train_idx, , drop = FALSE]
+    x_test  <- x[test_idx, , drop = FALSE]
+    z_train <- z[train_idx]
+    z_test  <- z[test_idx]
+    
+    # Ran into issues with some factor levels not appearing in a fold at all
+    if (length(unique(z_train)) < length(levels(z))) {
+      warning("Some classes are missing in this fold")
+      err[i, 1] <- 1
+      err[i, 2] <- 1
+      err[i, 3] <- 1
+      next
+    }
+    
+    df_train <- data.frame(z = z_train, x_train)
+    df_test  <- data.frame(x_test)
+    
+    # Errors are rarely thrown for some models. The below penalizes errors so
+    # that if a model throws an error in any iteration it simply is avoided
+    
+    # Logistic Regression
+    logit_fit <- tryCatch({
+      logit_fit <- multinom(z ~ ., data = df_train, trace = FALSE)
+    }, error = function(e) {
+      NULL  
+    })
+    if (!is.null(logit_fit)) {
+      logit_preds <- predict(logit_fit, newdata = df_test, type = "class")
+      err[i, 1] <- mean(logit_preds != z_test)
+    } else {
+      err[i, 1] <- k
+    }
+
+    # Linear Discriminant Analysis
+    lda_fit <- tryCatch({
+      lda(z ~ ., data = df_train)
+    }, error = function(e) {
+      NULL  
+    })
+    if (!is.null(lda_fit)) {
+      lda_pred <- predict(lda_fit, newdata = df_test)$class
+      err[i, 2] <- mean(lda_pred != z_test)
+    } else {
+      err[i, 2] <- k
+    }
+    
+    
+    # Naive Bayes
+    nb_fit <- tryCatch({
+      nb_fit <- naiveBayes(z ~ ., data = df_train)
+    }, error = function(e) {
+      NULL  
+    })
+    if (!is.null(nb_fit)) {
+      nb_pred <- predict(nb_fit, newdata = df_test)
+      err[i, 3] <- mean(nb_pred != z_test)
+    } else {
+      err[i, 3] <- k
+    }
+    
+  }
+  
+  # Choose best model
+  cv_err <- colMeans(err)
+  best_model <- which.min(cv_err)
+  df_full <- data.frame(z, x)
+  new_df <- data.frame(new_x)
+  
+  # Fit best model on full data
+  if (best_model == 1) {
+    best_fit <- multinom(z ~ ., data = df_full, trace = FALSE)
+    best_probs <- predict(best_fit, newdata = new_df, type = "probs")
+  } else if (best_model == 2) {
+    best_fit <- lda(z ~ ., data = df_full)
+    best_probs <- predict(best_fit, newdata = new_df)$posterior
+  } else {
+    best_fit <- naiveBayes(z ~ ., data = df_full)
+    best_probs <- predict(best_fit, newdata = new_df, type = "raw")
+  }
+  
+  # Simulate z based on predicted probabilities
+  if (is.null(dim(best_probs))) {
+    best_probs <- cbind(1-best_probs, best_probs)
+  }
+    
+  z_sim <- rmult(best_probs)
+  names(z_sim) <- NULL
+  z_lev <- factor(z_sim, levels = 1:length(levels(z)), labels = levels(z))
+
+  return(z_lev)
+}
+```
+
+```{r categorical simulation for sparse targets}
+class_sim_no_cv <- function(z, x, k, new_x) { 
+  df <- data.frame(z, x)
+  # Logistic regression chosen for structure and resiliency
+  # Only 4 features, so should not overfit
+  logit_fit <- multinom(z ~ ., data = df, trace = FALSE)
+  logit_probs <- predict(logit_fit, newdata = data.frame(new_x), type = "prob")
+  
+  new_df <- data.frame(new_x)
+  
+  # Simulate z based on predicted probabilities
+  if (is.null(dim(logit_probs))) {
+    logit_probs <- cbind(1-logit_probs, logit_probs)
+  }
+    
+  z_sim <- rmult(logit_probs)
+  names(z_sim) <- NULL
+  z_lev <- factor(z_sim, levels = 1:length(levels(z)), labels = levels(z))
+
+  return(z_lev)
+}
+```
+
+
+```{r simulation}
+# Define training matrix from acc_ci dataframe
+features <- c("dti", "loan_amnt", "emp_length_f", "risk", "emp_len")
+
+risk_high <- acc_ci$fico_range_high
+risk_low <- acc_ci$fico_range_low
+risk <- (risk_low + risk_high) / 2
+acc_x_train <- data.frame(risk)
+
+acc_x_train$dti <- acc_ci$dti
+acc_x_train$loan_amnt <- acc_ci$loan_amnt
+acc_x_train$emp_len <- acc_ci$emp_length_f
+
+# Outliers in rej_c are causing problems--there aren't many so I remove them
+rej_c$dti <- remove_outliers(rej_c$dti)
+rej_c$loan_amnt <- remove_outliers(rej_c$loan_amnt)
+rej_c <- na.omit(rej_c)
+
+# Prepare for simulation
+z_train <- dplyr::select(acc_c, -any_of(c(features, "defaults"))) 
+ind <- sample(nrow(z_train), floor(nrow(z_train) / 6),
+                          replace = FALSE)
+acc_x_train <- acc_x_train[ind,]
+z_train <- z_train[ind,]
+
+rej_c <- rej_c[, names(acc_x_train), drop = FALSE]
+rej_hat <- rej_c
+
+# Simulate all remaining
+for (i in 1:ncol(z_train)) {
+  z <- z_train[[i]] 
+  zname <- names(z_train)[i]
+  
+  # Sparse outputs are problematic with cv, so I use logit to predict them
+  if (zname == "default" || zname == "addr_state_f" || zname == "purpose_f" || zname == "loan_status_f" || zname == "verification_status_f" || zname == "hardship_reason_f") { 
+    z_hat <- class_sim_no_cv(z=z, x=acc_x_train, k=4, new_x=rej_c)
+    rej_hat[[zname]] <- z_hat
+  } else if (is.factor(z)) {
+    z_hat <- class_sim_cv(z=z, x=acc_x_train, k=4, new_x=rej_c)
+    rej_hat[[zname]] <- z_hat
+  } else if (is.numeric(z)) {
+    z <- remove_outliers(z)
+    keep_idx <- !is.na(z)
+    z <- z[keep_idx]
+    x_sub <- acc_x_train[keep_idx, , drop = FALSE]
+
+    z_hat <- num_sim_cv(z=z, x=x_sub, k=4, new_x=rej_c)
+    rej_hat[[zname]] <- z_hat
+  }
+  print(paste("Completed:", zname))
+}
+
+# Risk was necessary to include in the simulation, but now that low and high
+# fico ranges are selected I will use those in lieu of risk going forward.
+# So, risk is removed the final rej and acc dataframes from here forward.
+acc_fin <- dplyr::select(cbind(z_train, acc_x_train), -any_of("risk"))
+rej_hat <- dplyr::select(rej_hat, -any_of("risk"))
+
+saveRDS(cbind(z_train, acc_x_train), file="accClean.Rda")
+saveRDS(rej_hat, file="rejSims.Rda")
+```
+
+```{r simulation examination}
+# Print the actual and simulated mean and variance for all numerical variables
+acc_fin <- readRDS("accClean.Rda")
+rej_sim <- readRDS("rejSims.Rda")
+col <- names(acc_fin)[1]
+for (col in names(acc_fin)) {
+  if (is.numeric(acc_fin[[col]]) && is.null(rej_sim[[col]])) {
+    print(col)
+    print(paste("Actual Mean:", mean(acc_fin[[col]])))
+    print(paste("Simulated Mean:", mean(rej_sim[[col]])))
+    print(paste("Actual Variance:", var(acc_fin[[col]])))
+    print(paste("Simulated Variance:", var(rej_sim[[col]])))
+    print("")
+  }
+}
+
+# Predictions for fico_range_low and fico_range_high have highly different
+# means and variances. It does not appear that this is not a model issue, but 
+# it does appear that this indicate who was accepted and rejected for loans.
+hist(acc_fin$fico_range_low)
+hist(acc_fin$fico_range_high)
+hist(rej_sim$fico_range_low)
+hist(rej_sim$fico_range_high)
+```
+
+```{r recovery simulation}
+frac_recov <- function(inc, dti, amnt, fico_low, fico_high) {
+  
+  # The following is the true data model
+  b0 <- 1
+  b1 <- -3
+  b2 <- 2
+  b3 <- 2
+  
+  risk <- scale((fico_low + fico_high) / 2) # Divisor for clarity, only
+  lin_recov <- b0 + b1*scale(inc)*(1-(dti / 100)) + b2*scale(amnt) + b3*risk
+  
+  # Noise is injected
+  lin_recov_noisy <- rnorm(nrow(lin_recov), lin_recov, 1.5)
+  
+  # A logistic function is used function as a transformation of the true model 
+  # to enforce that the fraction recovered is between 0 and 1.
+  recov <- 1 / (1 + exp(lin_recov_noisy))
+  
+  return(recov)
+}
+
+
+acc_fin$recov <- ifelse(acc_fin$defaults == 1, 
+                        frac_recov(acc_fin$annual_inc, acc_fin$dti, 
+                                   acc_fin$funded_amnt, acc_fin$fico_range_low,
+                                   acc_fin$fico_range_high), 0)
+hist(subset(acc_fin$recov, acc_fin$recov > 0))
+```
+
+```{r rejection default and recovery sim}
+rej_sim$defaults <- default_sim(rej_sim$annual_inc, rej_sim$dti,
+                                rej_sim$funded_amnt, rej_sim$fico_range_low,
+                                rej_sim$fico_range_high)
+
+rej_sim$recov <- ifelse(rej_sim$defaults == 1,
+                        frac_recov(rej_sim$annual_inc, rej_sim$dti,
+                                    rej_sim$funded_amnt, rej_sim$fico_range_low,
+                                    rej_sim$fico_range_high), 0)
+
+# In the rejected set, about 5% default. This is higher, as expected, but still
+# a believable value compared to the accepted set's 1%. Recovery is actually a 
+# bit higher generally, but that is not disqualifying.
+mean(rej_sim$defaults == 1)
+hist(subset(rej_sim$recov, rej_sim$recov > 0))
+
+acc_fin$accepted <- 1
+rej_sim$accepted <- 0
+
+full <- rbind(acc_fin, rej_sim)
+full$accepted <- as.factor(full$accepted)
+```
+
+```{r rejection exploration}
+# I noticed odd behavior when simulating fico scores.
+hist(acc$fico_range_low)
+min(na.omit(acc$fico_range_low))
+sum(is.na(acc$fico_range_low))
+
+# In the entire accepted set, there are 0 applicants with known fico lower 
+# bound below 610, and only 33 of >2mil have unknown fico lower bounds.
+# i.e. First, reject all applicants with < 610 fico lower bound.
+# Maybe some sort of simple screening was used by Loan Club? Maybe a tree?
+
+sum(is.na(rej_left$risk)) # Why so many na, but only in risk?
+                          # Maybe they didn't even query for credit scores?
+```
+
+``` {r reverse engineering}
+# Create cleaned set, include NAs
+dti <- as.numeric(gsub("%","", rej$`Debt-To-Income Ratio`))
+rej_rev <- data.frame(dti)
+rej_rev$dti <- dti
+sum(is.na(rej_rev$dti)) 
+rej_rev$loan_amnt <- rej$`Amount Requested`
+sum(is.na(rej_rev$loan_amnt))
+rej_rev$risk <- rej$Risk_Score 
+sum(is.na(rej_rev$risk)) # Risk is the only variable with NAs in rej
+
+rej_rev <- rej_rev[sample(nrow(rej_rev), 1000000, replace = FALSE),]
+
+# Would generate a var for the tree to handle NAs, but no NAs are in the
+# accepted set, so the tree would simply predict $risk_na -> rejected=1
+# That is, it is necessary to just omit NAs
+
+rej_rev <- na.omit(rej_rev)
+rej_rev$rejected <- 1
+
+# Take analogous variables from acc
+acc_rev <- acc[sample(nrow(acc), 1000000, replace = FALSE),]
+acc_rev <- dplyr::select(acc_rev, any_of(c("dti", "loan_amnt", "fico_range_low",
+                                           "fico_range_high")))
+sum(is.na("dti"))
+sum(is.na("loan_amnt"))
+sum(is.na("fico_range_low"))
+sum(is.na("fico_range_high"))
+acc_rev$risk <- (acc_rev$fico_range_low + acc_rev$fico_range_high) / 2
+acc_rev <- dplyr::select(acc_rev, -c("fico_range_low", "fico_range_high"))
+
+acc_rev$rejected <- 0
+
+# Merge datasets and train the tree
+full <- rbind(acc_rev, rej_rev)
+full$rejected <- as.factor(full$rejected)
+
+rejection_tree <- tree(rejected ~ ., 
+                       data = full, 
+                       na.action = na.pass)
+
+cv_rej_tree <- cv.tree(rejection_tree)
+
+plot(rejection_tree, type = "uniform")
+text(rejection_tree, pretty = 0, cex = 0.8)
+
+print(cv_rej_tree)
+
+summary(rejection_tree)
+```
+
+```{r loan modeling}
+# Merge the simulated data from the rejected set with the accepted set
+sims <- rbind(rej_sim, acc_fin)
+
+acceptance_formula <- as.formula("accepted ~ . - defaults - recov")
+
+# Prepare for k-fold cross validation
+k <- 4
+n <- nrow(sims)
+folds <- sample(rep(1:k, length.out = n))
+err <- matrix(nrow = k, ncol = 4)
+
+for (i in 1:k) {
+  test_idx <- which(folds == i)
+  train_idx <- setdiff(1:n, test_idx)
+  
+  df_train <- sims[train_idx,]
+  df_test  <- sims[test_idx,]
+  
+  # Logistic Regression
+  logit_fit <- multinom(acceptance_formula, data = df_train, trace = FALSE)
+  
+  logit_preds <- predict(logit_fit, newdata = df_test, type = "class")
+  err[i, 1] <- mean(logit_preds != df_test$accepted)
+  
+
+  # Linear Discriminant Analysis
+  lda_fit <- lda(acceptance_formula, data = df_train)
+
+  lda_pred <- predict(lda_fit, newdata = df_test)$class
+  err[i, 2] <- mean(lda_pred != df_test$accepted)
+  
+  
+  # Naive Bayes
+  nb_fit <- naiveBayes(acceptance_formula, data = df_train)
+
+  nb_pred <- predict(nb_fit, newdata = df_test)
+  err[i, 3] <- mean(nb_pred != df_test$accepted)
+  
+  
+  ## Random Forest
+  randomForest(acceptance_formula, data = df_train)
+  
+  rf_pred <- predict(rf_fit, newdata = df_test)
+  err[i, 3] <- mean(nb_pred != df_test$accepted)
+}
+```
